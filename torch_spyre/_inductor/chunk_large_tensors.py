@@ -49,7 +49,7 @@ from torch_spyre._C import SpyreTensorLayout
 from . import config
 from .ir import FixedTiledLayout, SpyreReduction
 from .logging_utils import get_inductor_logger
-from .pass_utils import concretize_expr, device_coordinates, host_coordinates
+from .pass_utils import device_coordinates, host_coordinates
 from .views import matching_dim
 from .work_division import MAX_SPAN_BYTES
 
@@ -440,7 +440,7 @@ class TensorInfo:
 def _device_bytes(layout: FixedTiledLayout) -> int:
     """Total device-layout bytes including stick padding."""
     return (
-        math.prod(concretize_expr(s) for s in layout.device_layout.device_size)
+        math.prod(int(s) for s in layout.device_layout.device_size)
         * layout.dtype.itemsize
     )
 
@@ -534,9 +534,9 @@ def _make_reduction_chunk_layout(
         pass
 
     if device_split_dim is not None:
-        new_device_size = [concretize_expr(s) for s in orig_dl.device_size]
-        orig_device_dim_size = concretize_expr(orig_dl.device_size[device_split_dim])
-        orig_host_dim_size = concretize_expr(op.layout.size[split_dim])
+        new_device_size = [int(s) for s in orig_dl.device_size]
+        orig_device_dim_size = int(orig_dl.device_size[device_split_dim])
+        orig_host_dim_size = int(op.layout.size[split_dim])
         # Use ceil so a chunk smaller than one stick-group still gets 1 stick.
         new_device_size[device_split_dim] = max(
             1,
@@ -558,8 +558,8 @@ def _make_reduction_chunk_layout(
             )
     else:
         dim_order = _infer_dim_order(op, op.layout)
-        c_size = [concretize_expr(s) for s in chunk_host_size]
-        c_stride = [concretize_expr(s) for s in chunk_stride]
+        c_size = [int(s) for s in chunk_host_size]
+        c_stride = [int(s) for s in chunk_stride]
         chunk_stl = SpyreTensorLayout(c_size, c_stride, op.layout.dtype, dim_order)
 
     return FixedTiledLayout(
@@ -644,7 +644,7 @@ def _choose_split_dim(
     """
     write_dep = next(iter(op.get_read_writes().writes))
     output_symbols = list(write_dep.ranges.keys())
-    output_ranges = [concretize_expr(size) for size in op.data.ranges]
+    output_ranges = [int(size) for size in op.data.ranges]
 
     stick_host_dim: int | None = None
     if isinstance(op.layout, FixedTiledLayout):
@@ -759,7 +759,7 @@ def _chunk_reduction_op(
 
     # Capture original data before any mutation.
     original_data = op.data
-    original_ranges = [concretize_expr(r) for r in original_data.ranges]
+    original_ranges = [int(r) for r in original_data.ranges]
     full_size = original_ranges[split_dim]
 
     required_chunks = _required_chunks(
@@ -813,7 +813,7 @@ def _chunk_reduction_op(
             this_chunk_size = math.ceil(this_chunk_size / stick_elems) * stick_elems
         chunk_ranges = list(original_ranges)
         chunk_ranges[split_dim] = this_chunk_size
-        chunk_layout_size = [concretize_expr(s) for s in op.layout.size]
+        chunk_layout_size = [int(s) for s in op.layout.size]
         chunk_layout_size[split_dim] = this_chunk_size
 
         chunk_buf = ComputedBuffer(
@@ -911,4 +911,3 @@ def chunk_large_tensors(operations: list[Operation]) -> None:
                         i += n_inserted
 
         i += 1
-
