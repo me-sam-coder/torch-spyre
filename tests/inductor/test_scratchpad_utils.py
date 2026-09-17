@@ -227,7 +227,7 @@ def _layernorm_chain(x, weight, bias, normalized_shape):
     return y * 2 + y
 
 
-class LayerNormAddressingTest:
+class TestLayerNormAddressing:
     """LayerNorm correctness and LX residency under default lx_planning,
     including across core counts (#2533)."""
 
