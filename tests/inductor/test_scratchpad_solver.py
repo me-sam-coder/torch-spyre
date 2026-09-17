@@ -1759,7 +1759,7 @@ class TestPerCoreViewFrameMismatch:
             compare_with_cpu(bmm_then_reduce, x, y)
 
 
-class TestPerCoreViewFrameMismatchDeep:
+class TestPerCoreViewFrameMismatchExtended:
     """Extends TestPerCoreViewFrameMismatch with a wider sencores sweep,
     including sencores=1 to cover _per_core_view_on_buf's single-core
     path."""

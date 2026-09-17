@@ -475,7 +475,7 @@ class ParameterizedScratchpadUsage(
             "cpsat",
             "simulated_annealing",
         ),
-        "sencores": (1, 4, 8, 32),
+        "sencores": (1, 32),
         "co_optimization": (False, True),
     }
 
