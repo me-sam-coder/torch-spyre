@@ -193,7 +193,7 @@ class TestFusedNodeLayoutPropagation:
                     reason="padding.py's _pad_restickify_input assert "
                     "len(syms) == 1 fails before reaching layout "
                     "propagation; unrelated to what this test targets",
-                    strict=False,
+                    strict=True,
                 ),
             ),
             (1, 4, 64, 32),

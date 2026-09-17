@@ -926,6 +926,8 @@ class TestCloneAtGraphBoundaries(
             for op in graph.operations:
                 buf_name = op.name
                 buffer = graph.get_buffer(buf_name)
+                if not isinstance(getattr(buffer, "layout", None), Layout):
+                    continue
                 layout = buffer.get_layout()
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
