@@ -178,6 +178,9 @@ class TestFusedNodeLayoutPropagation:
             cfn(*device_args)
         return captured
 
+    # The (1, 2, 32, 16) case is marked xfail because it hits the
+    # _pad_restickify_input assertion tracked in
+    # https://github.com/torch-spyre/torch-spyre/issues/4671
     @pytest.mark.parametrize(
         "b,h,s,d",
         [
