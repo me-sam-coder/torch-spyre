@@ -728,7 +728,7 @@ std::unique_ptr<JobPlan> prepareKernel(
   auto jobplan = builder.build();
 
   // Dump JobPlan if debug logging is enabled
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": JobPlan:\n" << *jobplan;
+  SPYRE_RUNTIME_DEBUG() << "JobPlan:\n" << *jobplan;
 
   return jobplan;
 }
