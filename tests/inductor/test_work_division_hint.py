@@ -967,17 +967,25 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
         "layout_solver": "greedy",
+        # co_optimizing_lx_planning defaults on; greedy has no core-division-
+        # capable solver to co-optimize with (select_allocator).
+        "co_optimizing_lx_planning": False,
     }
 )
 def test_restickify_consumer_of_an_lx_source_stays_lx_resident_device():
     """Device counterpart of test_restickify_lx_read_requires_the_same_
     physical_owners: a restickify reading its LX-pinned producer at the SAME
     physical ownership it was produced under must keep that producer LX
-    resident, not fall back to HBM the way a cross-frame restickify would."""
+    resident, not fall back to HBM the way a cross-frame restickify would.
+
+    Shape is 16x a minimal (8, 32, 64) buffer: a smaller buffer here is
+    below the cost model's LX-placement threshold regardless of ownership
+    matching, independent of #4153's guarantee itself -- this size is
+    confirmed to land in LX."""
 
     torch.manual_seed(0)
-    x = torch.randn(8, 32, 64, dtype=torch.float16)
-    for name, size in (("B", 8), ("M", 32), ("K", 64)):
+    x = torch.randn(8, 128, 256, dtype=torch.float16)
+    for name, size in (("B", 8), ("M", 128), ("K", 256)):
         _declare_tensor_dim(name, size)
 
     def fn(x):
@@ -1212,6 +1220,9 @@ def test_late_core_mapping_keeps_blocks_after_alignment_device():
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
         "layout_solver": "greedy",
+        # co_optimizing_lx_planning defaults on; greedy has no core-division-
+        # capable solver to co-optimize with (select_allocator).
+        "co_optimizing_lx_planning": False,
     }
 )
 def test_equal_ownership_needs_no_relayout_device():
