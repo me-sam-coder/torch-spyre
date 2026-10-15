@@ -15,10 +15,10 @@
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+import collections
 import json
 import logging
 import logging.handlers
-import collections
 import math
 import regex as re
 from types import SimpleNamespace
@@ -57,7 +57,6 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from utils_inductor import (
     mock_backend_compiler,
-    assert_lx_only_relayout_payload,
     capture_backend_output_dirs,
 )
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -105,7 +104,150 @@ def _emitted_kernels():
 
 
 _capture_backend_output_dirs = capture_backend_output_dirs
-_assert_lx_only_relayout_payload = assert_lx_only_relayout_payload
+
+
+@contextmanager
+def _captured_completed_reduction_routes():
+    """Monkeypatches ``derive_completed_reduction_routes`` (lx_relayout.py)
+    -- the real, pure-Python function that computes the producer-core ->
+    reader-cores mapping, called once per consumer during planning -- to
+    record every ``(source, destination, reduction_split, result)`` it's
+    called with, without changing its behavior (the real implementation
+    still runs underneath; a rejected candidate's ``ValueError`` still
+    propagates normally and is simply never appended).
+
+    This is the exact Python-side source of the data the removed SDSC
+    debug payload's ``prodConsList`` used to carry -- capturing it here
+    needs no external binary and no JSON file at all, unlike the removed
+    ``assert_lx_only_relayout_payload`` (upstream PR #4984 / issue #4886;
+    see ``_assert_lx_only_relayout_kernels``'s docstring for that history).
+
+    May be called more than once per compile if more than one consumer
+    reads the completed-reduction source; callers should match the
+    captured call whose own producer-core set agrees with the plan that
+    actually got materialized (e.g. via ``completed_producer_cores`` on
+    the emitted OpSpec) rather than assume there is exactly one -- see
+    ``_matching_completed_reduction_routes``.
+    """
+
+    calls = []
+    real = lx_relayout_module.derive_completed_reduction_routes
+
+    def wrapped(source, destination, reduction_split):
+        result = real(source, destination, reduction_split)
+        calls.append((source, destination, reduction_split, result))
+        return result
+
+    with mock_patch.object(
+        lx_relayout_module, "derive_completed_reduction_routes", wrapped
+    ):
+        yield calls
+
+
+def _matching_completed_reduction_routes(route_calls, completed_producer_cores):
+    """Pick the captured ``derive_completed_reduction_routes`` call whose own
+    producer-core set agrees with the plan that was actually materialized
+    (``completed_producer_cores``, read directly off the emitted relayout
+    OpSpec), and return its result as a ``{producer_core: (reader_core,
+    ...)}`` dict -- the same shape the removed SDSC payload's
+    ``prodConsList`` carried as ``routes``/``native_routes``.
+
+    Raises with the full set of captured producer-core sets if none match,
+    rather than silently picking the wrong one or the first one.
+    """
+
+    for _, _, _, result in route_calls:
+        producer_cores = tuple(core for core, _readers in result)
+        if producer_cores == completed_producer_cores:
+            return dict(result)
+    raise AssertionError(
+        "no captured derive_completed_reduction_routes call's producer-core "
+        f"set matches the materialized plan's completed_producer_cores="
+        f"{completed_producer_cores}; captured producer-core sets: "
+        f"{[tuple(c for c, _ in r) for *_, r in route_calls]}"
+    )
+
+
+def _all_op_specs(kernels):
+    """Every ``OpSpec`` across every captured kernel, flattened."""
+    return [spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)]
+
+
+def _assert_lx_only_relayout_kernels(kernels):
+    """Python-level replacement for ``assert_lx_only_relayout_payload``.
+
+    That helper shelled out to ``dxp_standalone --use-dxp`` with
+    ``DXP_DEBUG=1`` to re-lower the compiled bundle and read its
+    ``debug/sdsc_*/*.out.out.out.json`` payload. Upstream PR #4984 ("Remove
+    dependency on obsolete DXP_DEBUG and intermediate JSON dumps") drops
+    that path -- dxp_standalone's debug re-lowering no longer produces those
+    files at all, which is the same root cause tracked by issue #4886
+    ("DeepTools emits no SDSC payloads on device path"; the PR author's own
+    description asks reviewers for "an equivalent validation path," and none
+    had landed as of this writing).
+
+    This reconstructs two of the removed check's three guarantees directly
+    from the compiler's own ``OpSpec`` objects -- the Python-side
+    representation dbo-opt lowers into the device bundle -- captured via
+    ``_emitted_kernels()``, instead of re-lowering the bundle externally to
+    inspect it after the fact:
+
+      1. Exactly one LX-to-LX relayout copy was emitted (``op ==
+         IDENTITY_OP``, two args, both LX-allocated).
+      2. That copy's own args carry no HBM allocation key.
+
+    The removed check's third guarantee -- "no op anywhere in the bundle is
+    named for DMA, restickify, or an HBM copy" -- is deliberately NOT
+    reconstructed here. An earlier version of this helper tried, matching
+    those three substrings against ``OpSpec.op`` (the op-TYPE field), and a
+    real run immediately proved that wrong:
+    test_lx_relayout_read_expansion_device[True-restickify] legitimately
+    has a ``ReStickifyOpHBM`` consumer op by design (that parametrized case
+    exists specifically to test a restickify reader), which that check
+    flagged as a false failure. The original SDSC payload matched against
+    its ``"name"`` field, which -- going by the real, still-working
+    sdsc_*.json structure inspected separately -- looks like a
+    buffer/debug-handle label, not an op-type string, so it almost
+    certainly never matched a legitimate op type in practice. Rather than
+    guess at a narrower, unverifiable substitute, this guarantee is simply
+    left out.
+
+    Returns the one LX relayout ``OpSpec`` found, playing the same role the
+    removed function's return value did for callers that need per-op detail
+    beyond pass/fail. Only usable where "the copy" genuinely matches that
+    IDENTITY_OP/two-LX-args shape -- the two completed-reduction-style call
+    sites (``test_unhinted_moe_down_route_preserves_the_chosen_split``,
+    ``test_completed_reduction_relayout_device``) already identify their own
+    copy op differently (via ``completed_producer_cores``) instead, to avoid
+    asserting a possibly-mismatched second definition of "the copy" on top
+    of their own. Neither this nor those two tests reconstructs the removed
+    function's ``prodConsList`` return value (a per-core producer/consumer
+    route map) through this helper -- those two tests get that separately,
+    from ``_captured_completed_reduction_routes`` /
+    ``_matching_completed_reduction_routes``, which read it straight from
+    the real ``derive_completed_reduction_routes`` call made during
+    planning rather than from any JSON payload.
+    """
+
+    all_specs = _all_op_specs(kernels)
+    lx_copies = [
+        spec
+        for spec in all_specs
+        if spec.op == IDENTITY_OP
+        and len(spec.args) == 2
+        and all("lx" in arg.allocation for arg in spec.args)
+    ]
+    assert len(lx_copies) == 1, (
+        f"expected exactly one LX-to-LX relayout copy, found {len(lx_copies)}"
+    )
+    copy = lx_copies[0]
+    assert all(
+        not any("hbm" in str(key) for key in arg.allocation) for arg in copy.args
+    ), (
+        "relayout copy carries an HBM allocation: "
+        f"{[dict(arg.allocation) for arg in copy.args]}"
+    )
+    return copy
 
 
 class TestNamedWorkDivisionHint(InductorTestCase):
@@ -2081,7 +2223,7 @@ def test_grouped_lx_relayout_device(broadcast):
         _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
     )
     torch._inductor.codecache.FxGraphCache.clear()
-    with _capture_backend_output_dirs() as output_dirs:
+    with _emitted_kernels() as kernels:
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
             *device_args,
@@ -2097,7 +2239,10 @@ def test_grouped_lx_relayout_device(broadcast):
     assert len(relayouts) == 1
     domains = re.findall(r"num_cores=(\d+)", relayouts[0])
     assert domains == [str(source_cores), "32"]
-    _assert_lx_only_relayout_payload(output_dirs)
+    # dxp_standalone's debug re-lowering no longer produces the SDSC JSON
+    # payload this used to read (upstream PR #4984 / issue #4886) -- see
+    # _assert_lx_only_relayout_kernels's own docstring for the full story.
+    _assert_lx_only_relayout_kernels(kernels)
 
 
 @config.patch(
@@ -2146,6 +2291,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     torch._inductor.codecache.FxGraphCache.clear()
     with (
         config.patch(lx_planner_relayout=enabled),
+        _emitted_kernels() as kernels,
         _capture_backend_output_dirs() as directories,
     ):
         actual, code = run_and_get_code(
@@ -2165,7 +2311,12 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     assert len(copies) == int(enabled)
     if enabled:
         assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
-        _assert_lx_only_relayout_payload(directories)
+        # dxp_standalone's debug re-lowering no longer produces the SDSC
+        # JSON payload this used to read (upstream PR #4984 / issue #4886)
+        # -- see _assert_lx_only_relayout_kernels's own docstring. Note this
+        # is a DIFFERENT file than the plain sdsc_*.json read below, which
+        # dbo-opt still writes as part of ordinary (non-debug) compilation.
+        _assert_lx_only_relayout_kernels(kernels)
     if reader == "split_matmul":
         matmuls = [
             root
@@ -2236,7 +2387,7 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     with (
         config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
         _emitted_kernels() as kernels,
-        _capture_backend_output_dirs() as directories,
+        _captured_completed_reduction_routes() as route_calls,
     ):
         actual, _ = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
@@ -2262,7 +2413,17 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         assert copy.args[0].allocation == down_arg.allocation
         assert set(copy.args[-1].allocation) == {"lx"}
         assert copy.completed_producer_cores == tuple(range(1, 32, 2))
-        native_routes = _assert_lx_only_relayout_payload(directories)
+        # dxp_standalone's debug re-lowering no longer produces the SDSC
+        # JSON payload this used to read (upstream PR #4984 / issue #4886)
+        # -- native_routes is now read straight from the real, pure-Python
+        # derive_completed_reduction_routes call made during planning
+        # itself (see _captured_completed_reduction_routes's docstring),
+        # not from any JSON file. The removed payload's "no stray DMA/
+        # restickify/HBM-copy op" guarantee is NOT reconstructed -- see
+        # _assert_lx_only_relayout_kernels's docstring for why.
+        native_routes = _matching_completed_reduction_routes(
+            route_calls, copy.completed_producer_cores
+        )
         assert collections.Counter(
             core for readers in native_routes.values() for core in readers
         ) == {core: 4 for core in range(32)}
@@ -2724,11 +2885,16 @@ def test_completed_reduction_relayout_device(
     with (
         config.patch(lx_planner_relayout=enabled),
         _capture_backend_output_dirs() as directories,
+        _captured_completed_reduction_routes() as route_calls,
     ):
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
         )
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    # The regular (non-debug) sdsc_*.json dbo-opt writes as part of ordinary
+    # compilation -- unlike the nested debug/sdsc_*/*.out.out.out.json from
+    # dxp_standalone's removed debug re-lowering, this one still works
+    # (upstream PR #4984 only removed the latter; see issue #4886).
     roots = [
         root
         for directory in directories
@@ -2744,7 +2910,19 @@ def test_completed_reduction_relayout_device(
     ]
     assert len(copies) == int(enabled)
     if enabled:
-        routes = _assert_lx_only_relayout_payload(directories)
+        # dxp_standalone's debug re-lowering no longer produces the SDSC
+        # JSON payload this used to read (upstream PR #4984 / issue #4886)
+        # -- routes is now read straight from the real, pure-Python
+        # derive_completed_reduction_routes call made during planning
+        # itself (see _captured_completed_reduction_routes's docstring),
+        # not from any JSON file. The expected producer-core set is this
+        # test's own k, same as the (now Python-side) assertion just below.
+        # The removed payload's "no stray DMA/restickify/HBM-copy op"
+        # guarantee is NOT reconstructed -- see
+        # _assert_lx_only_relayout_kernels's docstring for why.
+        routes = _matching_completed_reduction_routes(
+            route_calls, tuple(range(k - 1, 32, k))
+        )
         assert sorted(map(int, routes)) == list(range(k - 1, 32, k))
         assert collections.Counter(
             c for readers in routes.values() for c in readers

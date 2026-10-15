@@ -28,6 +28,9 @@ the plan (views under the chosen divisions, solved addresses), the existing
 computes the right numbers on device.
 """
 
+from contextlib import contextmanager
+from unittest.mock import patch as mock_patch
+
 import pytest
 
 pytest.importorskip("ortools")
@@ -36,10 +39,79 @@ import torch
 
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
+from torch_spyre._inductor.constants import IDENTITY_OP
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
+from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+
+
+@contextmanager
+def _emitted_kernels():
+    """Collect every kernel the backend emits during one compile.
+
+    Duplicated from test_work_division_hint.py's own helper of the same
+    name, matching that file's convention (and test_restickify_lx_
+    residency_diagnostics.py's) of duplicating rather than importing, so
+    this file has no dependency on another test module.
+    """
+
+    kernels = []
+    real_codegen = SpyreKernel.codegen_kernel
+
+    def codegen_kernel(kernel):
+        kernels.append(kernel)
+        return real_codegen(kernel)
+
+    with mock_patch.object(
+        SpyreKernel, "codegen_kernel", side_effect=codegen_kernel, autospec=True
+    ):
+        yield kernels
+
+
+def _assert_lx_only_relayout_kernels(kernels):
+    """Python-level replacement for ``assert_lx_only_relayout_payload``,
+    duplicated from test_work_division_hint.py's own helper of the same
+    name -- see that copy's docstring for the full story (upstream PR
+    #4984 removed the SDSC JSON payload this used to read; issue #4886
+    tracks the same root cause).
+
+    Does NOT sweep for a stray DMA/restickify/HBM-copy op by name -- an
+    earlier version of this helper did, matching those substrings against
+    ``OpSpec.op`` (the op-TYPE field), and a real run of the sibling check
+    in test_work_division_hint.py immediately proved that wrong: a
+    legitimate restickify CONSUMER op (by design, in a different test) got
+    flagged as if it were a stray HBM-bound move. The original SDSC
+    payload matched against its ``"name"`` field, which looks like a
+    buffer/debug-handle label rather than an op-type string, so it almost
+    certainly never matched a real op type in practice -- see
+    test_work_division_hint.py's ``_assert_lx_only_relayout_kernels``
+    docstring for the full account. Left out here rather than guessed at
+    again.
+    """
+
+    all_specs = [
+        spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)
+    ]
+    lx_copies = [
+        spec
+        for spec in all_specs
+        if spec.op == IDENTITY_OP
+        and len(spec.args) == 2
+        and all("lx" in arg.allocation for arg in spec.args)
+    ]
+    assert len(lx_copies) == 1, (
+        f"expected exactly one LX-to-LX relayout copy, found {len(lx_copies)}"
+    )
+    copy = lx_copies[0]
+    assert all(
+        not any("hbm" in str(key) for key in arg.allocation) for arg in copy.args
+    ), (
+        "relayout copy carries an HBM allocation: "
+        f"{[dict(arg.allocation) for arg in copy.args]}"
+    )
+    return copy
 
 
 def _no_matches(self, consumer_op, consumer_divs, parent_names, *args, **kwargs):
@@ -427,23 +499,22 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
 
     from relayout_fixtures import grouped_relayout_graph
-    from utils_inductor import (
-        assert_lx_only_relayout_payload,
-        capture_backend_output_dirs,
-    )
 
     observed = _Observed(monkeypatch, force=False)
     fn, args, reference, expect = grouped_relayout_graph(kind)
     with (
         config.patch({**_COOPT, "sencores": 32}),
-        capture_backend_output_dirs() as dirs,
+        _emitted_kernels() as kernels,
     ):
         out = torch.compile(fn, dynamic=False, options={"epilogue_fusion": False})(
             *args
         )
 
     observed.assert_emitted_in_lx(expected_plans=1)
-    assert_lx_only_relayout_payload(dirs)
+    # dxp_standalone's debug re-lowering no longer produces the SDSC JSON
+    # payload this used to read (upstream PR #4984 / issue #4886) -- see
+    # _assert_lx_only_relayout_kernels's own docstring for the full story.
+    _assert_lx_only_relayout_kernels(kernels)
     (plan,) = observed.plans
     assert plan.num_cores == expect["source_cores"], "the plan keeps the source's"
     assert plan.destination_view.num_cores == expect["destination_cores"]
